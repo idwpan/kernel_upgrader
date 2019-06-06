@@ -1,15 +1,51 @@
 #!/usr/bin/env python3
-import logging, logging.config
+
+import bs4
+import dotenv
+import logging
+import logging.config
 import os
+import pathlib
 import requests
 import signal
+import subprocess
 import sys
 import time
+import yaml
 
-from bs4 import BeautifulSoup
-from pathlib import Path
-from dotenv import load_dotenv
-from subprocess import Popen, PIPE
+
+# Global vars
+PRERUN_SAFETY_TIME = 5  # time to sleep before running
+
+ENV_PATH = pathlib.Path('.') / '.env'
+dotenv.load_dotenv(dotenv_path=ENV_PATH)
+
+if 'SUDO_PASS' in os.environ:
+    SUDO_PASS = os.getenv('SUDO_PASS')
+else:
+    uid = os.getuid()
+    if uid == 0:
+        SUDO_PASS = None
+    else:
+        logging.error("Error: Not running as root (uid={uid}, not 0) and SUDO_PASS is not defined in .env.o")
+        logging.error("Exiting.")
+        sys.exit(0)
+
+with open('./logging_config.yaml', 'rt') as log_cfg:
+    try:
+        cfg = yaml.safe_load(log_cfg.read())
+        logging.config.dictConfig(cfg)
+    except Exception as e:
+        print(e)
+        print('Error setting up logging.')
+        sys.exit(0)
+
+
+def safety(seconds=PRERUN_SAFETY_TIME):
+    """Pauses to allow the user to exit before initiating a Kernel upgrade"""
+    logging.warning("If you do not want to upgrade your Kernel, or aren't comfortable using this program, please hit Ctrl+C now.")
+    logging.warning(f"Now sleeping for {seconds} seconds.")
+    time.sleep(seconds)
 
 
 def signal_handler(sig, frame):
@@ -21,20 +57,12 @@ def signal_handler(sig, frame):
     print('You pressed Ctrl+C!')
     sys.exit(0)
 
-signal.signal(signal.SIGINT, signal_handler)
-
-logging.config.fileConfig('./logging_config.ini')
-
-# Pull sudo pass from .env file.
-ENV_PATH = Path('.') / '.env'
-load_dotenv(dotenv_path=ENV_PATH)
-SUDO_PASS = os.getenv('SUDO_PASS')
-
 
 def soupify(url):
     """Perform GET request and load into BeautifulSoup"""
     r = requests.get(url)
-    return BeautifulSoup(r.text, 'html.parser')
+    return bs4.BeautifulSoup(r.text, 'html.parser')
+
 
 class Kernel:
     """Class to handle fetching of latest kernel version
@@ -200,9 +228,14 @@ class Upgrade(Kernel):
 
         """
         command = f"dpkg -i ./{filename}".split()
-        p = Popen(['sudo', '-S'] + command, stdout=PIPE, stdin=PIPE, stderr=PIPE, universal_newlines=True)
-        sudo_prompt = p.communicate(SUDO_PASS + '\n')[1]
-        rc = p.poll()
+        if SUDO_PASS:
+            p = subprocess.Popen(['sudo', '-S'] + command, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            sudo_prompt = p.communicate(SUDO_PASS + '\n')[1]
+            rc = p.poll()
+        else:
+            p = subprocess.run(command)
+            rc = p.returncode
+
         logging.debug(f"{self._shorten_name(filename)} install return code: {rc}")
         return rc
 
@@ -300,24 +333,24 @@ class Upgrade(Kernel):
             f.write(resp)
         f.close()
 
-def double_check():
-    """Pauses for 15 seconds to allow the user to exit before initiating a Kernel upgrade"""
-    logging.warning("If you do not want to upgrade your Kernel, or aren't comfortable using this program, please hit Ctrl+C now.")
-    logging.warning("Now sleeping for 15 seconds.")
-    time.sleep(15)
 
 
 def main():
     """Main function to run a Kernel upgrade for Ubuntu"""
 
-    # safety first
-    double_check()
+    # set up interrupt handler so ctrl-c is caught
+    signal.signal(signal.SIGINT, signal_handler)
 
+    # sleep before upgrade
+    safety()
+
+    # upgrade
     logging.info(f"Begining Kernel upgrade for Ubuntu")
     start_time = time.perf_counter()
 
     u = Upgrade()
 
+    # check return values and determine success/failure
     if all(u.return_codes):
         logging.info("Looks like all the installations completed successfully!")
         logging.info("Be sure to skim over ./debug.log to be sure :)")
